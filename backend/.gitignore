@@ -1,0 +1,6 @@
+.env
+*.exe
+*.test
+/tmp/
+tmp/
+build-errors.log
