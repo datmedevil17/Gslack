@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/datmedevil/slack/backend/internal/middleware"
 	"github.com/datmedevil/slack/backend/internal/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/generative-ai-go/genai"
@@ -17,30 +18,28 @@ import (
 
 // Handler holds two AI clients:
 //   - Groq (llama-3.3-70b via openai-compat API) → ultra-fast, used for real-time chat
-//   - Gemini (1.5-pro)                            → long-context, used for summarisation
+//   - Gemini (1.5-flash)                          → long-context, used for summarisation
 type Handler struct {
-	db          *gorm.DB
-	groq        *openai.Client  // fast inference
-	gemini      *genai.GenerativeModel // smart reasoning
+	db     *gorm.DB
+	groq   *openai.Client
+	gemini *genai.GenerativeModel
 }
 
 const (
-	groqBaseURL  = "https://api.groq.com/openai/v1"
-	groqModel    = "llama-3.3-70b-versatile" // best balance of speed + quality on Groq
-	geminiModel  = "gemini-1.5-flash"
+	groqBaseURL = "https://api.groq.com/openai/v1"
+	groqModel   = "llama-3.3-70b-versatile"
+	geminiModel = "gemini-1.5-flash"
 )
 
 func New(db *gorm.DB, geminiKey, groqKey string) *Handler {
 	h := &Handler{db: db}
 
-	// Groq client (OpenAI-compatible)
 	if groqKey != "" {
 		cfg := openai.DefaultConfig(groqKey)
 		cfg.BaseURL = groqBaseURL
 		h.groq = openai.NewClientWithConfig(cfg)
 	}
 
-	// Gemini client
 	if geminiKey != "" {
 		ctx := context.Background()
 		client, err := genai.NewClient(ctx, option.WithAPIKey(geminiKey))
@@ -56,11 +55,11 @@ func New(db *gorm.DB, geminiKey, groqKey string) *Handler {
 }
 
 const systemPrompt = `You are an AI assistant embedded in a team workspace (like Slack).
-You have access to recent channel messages. Be concise, direct, and helpful.
-Use plain text. Reference specific messages when relevant.`
+You have been given the full workspace context: all channels with their recent messages,
+direct messages, and member list. Use this context to give accurate, specific answers.
+Be concise, direct, and helpful. Use plain text. Reference specific messages or people when relevant.`
 
 // ─── POST /api/v1/ai/chat ─────────────────────────────────────────────────────
-// Uses Groq (fast) with channel history as context.
 func (h *Handler) Chat(c *gin.Context) {
 	if h.groq == nil && h.gemini == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI not configured"})
@@ -68,21 +67,28 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 
 	var req struct {
-		Message      string `json:"message" binding:"required"`
-		ChannelID    string `json:"channel_id"`
-		ContextLimit int    `json:"context_limit"`
+		Message     string `json:"message" binding:"required"`
+		WorkspaceID string `json:"workspace_id"`
+		ChannelID   string `json:"channel_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if req.ContextLimit <= 0 || req.ContextLimit > 100 {
-		req.ContextLimit = 40
+
+	sub, _ := c.Get(middleware.UserIDKey)
+	userID, _ := uuid.Parse(sub.(string))
+
+	var contextBlock string
+	if req.WorkspaceID != "" {
+		wid, err := uuid.Parse(req.WorkspaceID)
+		if err == nil {
+			contextBlock = h.buildWorkspaceContext(userID, wid)
+		}
+	} else if req.ChannelID != "" {
+		contextBlock = h.buildChannelContext(req.ChannelID, 40)
 	}
 
-	contextBlock := h.buildChannelContext(req.ChannelID, req.ContextLimit)
-
-	// Prefer Groq (faster), fall back to Gemini
 	if h.groq != nil {
 		reply, err := h.groqChat(c.Request.Context(), req.Message, contextBlock)
 		if err != nil {
@@ -102,7 +108,6 @@ func (h *Handler) Chat(c *gin.Context) {
 }
 
 // ─── POST /api/v1/ai/summarize/:channelID ─────────────────────────────────────
-// Uses Gemini (better long-context reasoning).
 func (h *Handler) Summarize(c *gin.Context) {
 	if h.gemini == nil && h.groq == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI not configured"})
@@ -132,7 +137,6 @@ Conversation:
 %s`, formatMessages(msgs))
 
 	var summary string
-	// Prefer Gemini for summarise; fall back to Groq
 	if h.gemini != nil {
 		resp, err := h.gemini.GenerateContent(c.Request.Context(), genai.Text(prompt))
 		if err == nil {
@@ -147,7 +151,6 @@ Conversation:
 }
 
 // ─── POST /api/v1/ai/reply-suggest/:messageID ─────────────────────────────────
-// Smart reply suggestions — uses Groq for speed.
 func (h *Handler) SuggestReplies(c *gin.Context) {
 	if h.groq == nil && h.gemini == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI not configured"})
@@ -190,7 +193,148 @@ Last message: "%s"`, formatMessages(thread), msg.Content)
 	c.JSON(http.StatusOK, gin.H{"suggestions": parseBullets(raw)})
 }
 
-// ─── Internal helpers ─────────────────────────────────────────────────────────
+// ─── Context builders ─────────────────────────────────────────────────────────
+
+// buildWorkspaceContext aggregates the entire workspace visible to userID:
+// workspace info, all members, all joined channels + recent msgs, all DMs + recent msgs.
+func (h *Handler) buildWorkspaceContext(userID, workspaceID uuid.UUID) string {
+	var sb strings.Builder
+
+	// Workspace info
+	var ws models.Workspace
+	if err := h.db.First(&ws, "id = ?", workspaceID).Error; err == nil {
+		sb.WriteString(fmt.Sprintf("=== Workspace: %s ===\n", ws.Name))
+		if ws.Description != nil && *ws.Description != "" {
+			sb.WriteString(fmt.Sprintf("Description: %s\n", *ws.Description))
+		}
+	}
+
+	// Workspace members
+	var members []models.WorkspaceMember
+	h.db.Where("workspace_id = ? AND is_active = true", workspaceID).
+		Preload("User").Find(&members)
+	if len(members) > 0 {
+		sb.WriteString(fmt.Sprintf("\n--- Members (%d) ---\n", len(members)))
+		for _, m := range members {
+			name := m.User.FullName
+			if name == "" {
+				name = m.User.Username
+			}
+			sb.WriteString(fmt.Sprintf("• %s (@%s) [%s]\n", name, m.User.Username, m.Role))
+		}
+	}
+
+	// Channels the user belongs to (up to 20 most recently active)
+	var chanMembers []models.ChannelMember
+	h.db.Where("user_id = ?", userID).Find(&chanMembers)
+	if len(chanMembers) > 0 {
+		chanIDs := make([]uuid.UUID, 0, len(chanMembers))
+		for _, cm := range chanMembers {
+			chanIDs = append(chanIDs, cm.ChannelID)
+		}
+
+		var channels []models.Channel
+		h.db.Where("workspace_id = ? AND id IN ? AND is_archived = false AND type IN ('public','private')",
+			workspaceID, chanIDs).
+			Order("last_message_at DESC NULLS LAST").
+			Limit(20).Find(&channels)
+
+		for _, ch := range channels {
+			var msgs []models.Message
+			h.db.Where("channel_id = ? AND is_deleted = false AND parent_id IS NULL", ch.ID).
+				Preload("Sender").Order("created_at DESC").Limit(15).Find(&msgs)
+			if len(msgs) == 0 {
+				continue
+			}
+			msgs = reverseMessages(msgs)
+
+			sb.WriteString(fmt.Sprintf("\n--- #%s", ch.Name))
+			if ch.Description != nil && *ch.Description != "" {
+				sb.WriteString(fmt.Sprintf(" (%s)", *ch.Description))
+			}
+			sb.WriteString(" ---\n")
+			sb.WriteString(formatMessages(msgs))
+		}
+	}
+
+	// DM conversations the user is part of (up to 15 most recent)
+	var dmParts []models.DMParticipant
+	h.db.Where("user_id = ?", userID).Find(&dmParts)
+	if len(dmParts) > 0 {
+		convoIDs := make([]uuid.UUID, 0, len(dmParts))
+		for _, p := range dmParts {
+			convoIDs = append(convoIDs, p.ConversationID)
+		}
+
+		var convos []models.DMConversation
+		h.db.Where("workspace_id = ? AND id IN ?", workspaceID, convoIDs).
+			Preload("Participants.User").
+			Limit(15).Find(&convos)
+
+		for _, convo := range convos {
+			var msgs []models.DMMessage
+			h.db.Where("conversation_id = ? AND is_deleted = false", convo.ID).
+				Preload("Sender").Order("created_at DESC").Limit(10).Find(&msgs)
+			if len(msgs) == 0 {
+				continue
+			}
+			for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+				msgs[i], msgs[j] = msgs[j], msgs[i]
+			}
+
+			label := buildDMLabel(convo, userID)
+			sb.WriteString(fmt.Sprintf("\n--- %s ---\n", label))
+			for _, m := range msgs {
+				name := m.Sender.Username
+				if name == "" {
+					name = "unknown"
+				}
+				sb.WriteString(fmt.Sprintf("[%s] %s: %s\n", m.CreatedAt.Format("15:04"), name, m.Content))
+			}
+		}
+	}
+
+	return sb.String()
+}
+
+func buildDMLabel(convo models.DMConversation, myID uuid.UUID) string {
+	if convo.IsGroup {
+		if convo.Name != nil && *convo.Name != "" {
+			return "Group DM: " + *convo.Name
+		}
+		return "Group DM"
+	}
+	var names []string
+	for _, p := range convo.Participants {
+		if p.UserID != myID {
+			n := p.User.FullName
+			if n == "" {
+				n = p.User.Username
+			}
+			names = append(names, n)
+		}
+	}
+	if len(names) > 0 {
+		return "DM with " + strings.Join(names, ", ")
+	}
+	return "DM"
+}
+
+func (h *Handler) buildChannelContext(channelID string, limit int) string {
+	if channelID == "" {
+		return ""
+	}
+	cid, err := uuid.Parse(channelID)
+	if err != nil {
+		return ""
+	}
+	var msgs []models.Message
+	h.db.Where("channel_id = ? AND is_deleted = false", cid).
+		Preload("Sender").Order("created_at DESC").Limit(limit).Find(&msgs)
+	return formatMessages(reverseMessages(msgs))
+}
+
+// ─── LLM helpers ──────────────────────────────────────────────────────────────
 
 func (h *Handler) groqChat(ctx context.Context, userMsg, contextBlock string) (string, error) {
 	messages := []openai.ChatCompletionMessage{
@@ -199,7 +343,7 @@ func (h *Handler) groqChat(ctx context.Context, userMsg, contextBlock string) (s
 	if contextBlock != "" {
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleSystem,
-			Content: "Recent channel messages:\n" + contextBlock,
+			Content: "Current workspace context:\n" + contextBlock,
 		})
 	}
 	messages = append(messages, openai.ChatCompletionMessage{
@@ -225,7 +369,7 @@ func (h *Handler) groqChat(ctx context.Context, userMsg, contextBlock string) (s
 func (h *Handler) geminiChat(ctx context.Context, userMsg, contextBlock string) (string, error) {
 	prompt := userMsg
 	if contextBlock != "" {
-		prompt = "Recent channel messages:\n" + contextBlock + "\n\nQuestion: " + userMsg
+		prompt = "Current workspace context:\n" + contextBlock + "\n\nQuestion: " + userMsg
 	}
 	resp, err := h.gemini.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
@@ -234,19 +378,7 @@ func (h *Handler) geminiChat(ctx context.Context, userMsg, contextBlock string) 
 	return extractGeminiText(resp), nil
 }
 
-func (h *Handler) buildChannelContext(channelID string, limit int) string {
-	if channelID == "" {
-		return ""
-	}
-	cid, err := uuid.Parse(channelID)
-	if err != nil {
-		return ""
-	}
-	var msgs []models.Message
-	h.db.Where("channel_id = ? AND is_deleted = false", cid).
-		Preload("Sender").Order("created_at DESC").Limit(limit).Find(&msgs)
-	return formatMessages(reverseMessages(msgs))
-}
+// ─── Formatting helpers ───────────────────────────────────────────────────────
 
 func formatMessages(msgs []models.Message) string {
 	var sb strings.Builder

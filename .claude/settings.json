@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(go build *)"
+      "Bash(go build *)",
+      "Bash(sips -g all /Users/datmedevil/projects/slack/app/app/logo.png)",
+      "Bash(sips -z 40 40 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/ios/app/Images.xcassets/AppIcon.appiconset/icon-20@2x.png)",
+      "Bash(sips -z 60 60 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/ios/app/Images.xcassets/AppIcon.appiconset/icon-20@3x.png)",
+      "Bash(sips -z 58 58 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/ios/app/Images.xcassets/AppIcon.appiconset/icon-29@2x.png)",
+      "Bash(sips -z 87 87 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/ios/app/Images.xcassets/AppIcon.appiconset/icon-29@3x.png)",
+      "Bash(sips -z 80 80 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/ios/app/Images.xcassets/AppIcon.appiconset/icon-40@2x.png)",
+      "Bash(sips -z 48 48 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/android/app/src/main/res/mipmap-mdpi/ic_launcher.png)",
+      "Bash(sips -z 48 48 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png)",
+      "Bash(sips -z 72 72 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/android/app/src/main/res/mipmap-hdpi/ic_launcher.png)",
+      "Bash(sips -z 72 72 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png)",
+      "Bash(sips -z 96 96 /Users/datmedevil/projects/slack/app/app/logo.png --out /Users/datmedevil/projects/slack/app/app/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png)"
     ]
   }
 }
